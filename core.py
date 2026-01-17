@@ -1,4 +1,5 @@
 import os
+import unicodedata
 from docx import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -7,24 +8,55 @@ from langchain_core.documents import Document as LangchainDocument
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from langchain_community.chat_message_histories import RedisChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 
 
 class InsuranceLawChatbot:
-    def __init__(self, docx_files_path, api_key=None):
+    def __init__(self, docx_files_path, api_key=None, redis_url="redis://localhost:6379"):
         """
         Initialize the RAG chatbot for Kazakhstani insurance laws using Mistral AI.
 
         Args:
             docx_files_path: Path to folder containing .docx files or list of file paths
             api_key: Mistral API key (or set MISTRAL_API_KEY env variable)
+            redis_url: Redis connection URL (default: redis://localhost:6379)
         """
         if api_key:
             os.environ["MISTRAL_API_KEY"] = api_key
 
         self.docx_files_path = docx_files_path
+        self.redis_url = redis_url
         self.vectorstore = None
         self.retriever = None
         self.chain = None
+
+    @staticmethod
+    def normalize_text(text):
+        """
+        Normalize text to avoid tokenizer issues with special characters.
+        Converts special Cyrillic/Latin lookalikes to standard characters.
+        """
+        # Normalize unicode (NFC normalization)
+        text = unicodedata.normalize('NFC', text)
+
+        # Replace common problematic characters
+        replacements = {
+            'һ': 'h',  # Cyrillic 'һ' to Latin 'h'
+            'ә': 'ə',  # Kazakh 'ә'
+            'ғ': 'ғ',  # Kazakh 'ғ'
+            'қ': 'қ',  # Kazakh 'қ'
+            'ң': 'ң',  # Kazakh 'ң'
+            'ө': 'ө',  # Kazakh 'ө'
+            'ұ': 'ұ',  # Kazakh 'ұ'
+            'ү': 'ү',  # Kazakh 'ү'
+            'і': 'і',  # Kazakh 'і'
+        }
+
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+
+        return text
 
     def load_docx_files(self):
         """Load all .docx files from the specified path."""
@@ -127,10 +159,17 @@ class InsuranceLawChatbot:
             temperature=0  # Low temperature for factual legal responses
         )
 
-        # Custom prompt for insurance law queries - OPTIMIZED FOR SHORT ANSWERS
+        # Custom prompt for insurance law queries - WITH CONVERSATION HISTORY
         template = """Вы - помощник по страховому законодательству Казахстана. 
 
-ВАЖНО: Давайте КРАТКИЕ ответы (2-4 предложения). Выделяйте только самую важную информацию.
+ВАЖНО: 
+- Если вопрос простой или пользователь НЕ просит подробности - давайте КРАТКИЙ ответ (2-4 предложения).
+- Если пользователь явно просит подробный ответ (слова: "подробно", "детально", "расскажи полностью", "все детали") - давайте развернутый ответ.
+- По умолчанию всегда отвечайте КРАТКО.
+- Если пользователь задает уточняющий вопрос (например, "а что такое п. 2.1?", "расскажи подробнее об этом"), используйте историю разговора для понимания контекста.
+
+История разговора:
+{chat_history}
 
 Используйте следующий контекст из законодательных документов для ответа на вопрос.
 Если вы не знаете ответа, скажите об этом. Не придумывайте информацию.
@@ -138,9 +177,9 @@ class InsuranceLawChatbot:
 
 Контекст: {context}
 
-Вопрос: {question}
+Текущий вопрос: {question}
 
-Краткий ответ (2-4 предложения):"""
+Ответ:"""
 
         prompt = ChatPromptTemplate.from_template(template)
 
@@ -148,9 +187,27 @@ class InsuranceLawChatbot:
         def format_docs(docs):
             return "\n\n".join(doc.page_content for doc in docs)
 
+        # Format chat history function
+        def format_chat_history(history):
+            if not history:
+                return "Нет предыдущих сообщений."
+            formatted = []
+            for msg in history[-6:]:  # Last 3 exchanges (6 messages)
+                if isinstance(msg, HumanMessage):
+                    formatted.append(f"Пользователь: {msg.content}")
+                elif isinstance(msg, AIMessage):
+                    formatted.append(f"Ассистент: {msg.content}")
+            return "\n".join(formatted)
+
+        # Store format functions for later use
+        self.format_docs = format_docs
+        self.format_chat_history = format_chat_history
+
         # Build the chain
         self.chain = (
-                {"context": self.retriever | format_docs, "question": RunnablePassthrough()}
+                {"context": self.retriever | format_docs,
+                 "question": RunnablePassthrough(),
+                 "chat_history": lambda x: ""}  # Will be filled in ask() method
                 | prompt
                 | llm
                 | StrOutputParser()
@@ -177,13 +234,13 @@ class InsuranceLawChatbot:
 
         print("RAG system built successfully!")
 
-    def ask(self, question, detailed=False):
+    def ask(self, question, user_id="default"):
         """
         Ask a question about insurance laws.
 
         Args:
             question: Question in Russian or Kazakh
-            detailed: If True, request detailed answer. If False (default), get short answer.
+            user_id: Unique identifier for the user (to maintain separate chat histories)
 
         Returns:
             dict with 'answer' and 'sources'
@@ -191,23 +248,57 @@ class InsuranceLawChatbot:
         if not self.chain:
             raise ValueError("Please run build() first to initialize the system")
 
-        # Modify question if detailed answer is requested
-        if detailed:
-            modified_question = f"{question}\n\nДай подробный ответ со всеми деталями."
-        else:
-            modified_question = question
+        # Normalize text to avoid tokenizer issues
+        normalized_question = self.normalize_text(question)
+
+        # Get or create Redis chat history for this user
+        chat_history = RedisChatMessageHistory(
+            session_id=f"user:{user_id}",
+            url=self.redis_url,
+            ttl=86400  # Keep history for 24 hours (optional)
+        )
 
         # Get relevant documents
-        relevant_docs = self.retriever.invoke(modified_question)
+        relevant_docs = self.retriever.invoke(normalized_question)
+
+        # Format chat history
+        formatted_history = self.format_chat_history(chat_history.messages)
+
+        # Prepare context with history
+        context_with_history = {
+            "context": self.format_docs(relevant_docs),
+            "question": normalized_question,
+            "chat_history": formatted_history
+        }
 
         # Get answer from chain
-        answer = self.chain.invoke(modified_question)
+        answer = self.chain.invoke(context_with_history)
+
+        # Add ORIGINAL question to chat history (not normalized)
+        chat_history.add_user_message(question)
+        chat_history.add_ai_message(answer)
 
         return {
             "answer": answer,
             "sources": [doc.metadata["source"] for doc in relevant_docs],
             "source_documents": relevant_docs  # Full chunks for reference
         }
+
+    def clear_history(self, user_id="default"):
+        """Clear chat history for a specific user."""
+        chat_history = RedisChatMessageHistory(
+            session_id=f"user:{user_id}",
+            url=self.redis_url
+        )
+        chat_history.clear()
+
+    def get_history(self, user_id="default"):
+        """Get chat history for a specific user."""
+        chat_history = RedisChatMessageHistory(
+            session_id=f"user:{user_id}",
+            url=self.redis_url
+        )
+        return chat_history.messages
 
     def load_existing_vectorstore(self):
         """Load previously created vector store without rebuilding."""
@@ -257,8 +348,6 @@ if __name__ == "__main__":
         print(f"\n{'=' * 60}")
         print(f"Вопрос: {question}")
         print('=' * 60)
-        result = chatbot.ask(question)  # Short answer by default
+        result = chatbot.ask(question)  # LLM decides short or detailed automatically
         print(f"Ответ: {result['answer']}")
         print(f"\nИсточники: {', '.join(set(result['sources']))}")
-
-        # For detailed answer, use: chatbot.ask(question, detailed=True)
