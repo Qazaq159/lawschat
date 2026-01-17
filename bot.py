@@ -1,252 +1,219 @@
 import os
-from docx import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_mistralai import MistralAIEmbeddings, ChatMistralAI
-from langchain_core.documents import Document as LangchainDocument
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+import logging
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from core import InsuranceLawChatbot  # Import your RAG module
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Global chatbot instance
+chatbot = None
 
 
-class InsuranceLawChatbot:
-    def __init__(self, docx_files_path, api_key=None):
-        """
-        Initialize the RAG chatbot for Kazakhstani insurance laws using Mistral AI.
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /start is issued."""
+    welcome_message = """
+🏛️ Добро пожаловать в бот по страховому законодательству Казахстана!
 
-        Args:
-            docx_files_path: Path to folder containing .docx files or list of file paths
-            api_key: Mistral API key (or set MISTRAL_API_KEY env variable)
-        """
-        if api_key:
-            os.environ["MISTRAL_API_KEY"] = api_key
+Я могу ответить на ваши вопросы о:
+• Видах страхования
+• Правах и обязанностях страхователя
+• Требованиях к страховым компаниям
+• Процедурах получения страховых выплат
+• И многом другом
 
-        self.docx_files_path = docx_files_path
-        self.vectorstore = None
-        self.retriever = None
-        self.chain = None
+Просто задайте свой вопрос, и я найду ответ в законодательных документах.
 
-    def load_docx_files(self):
-        """Load all .docx files from the specified path."""
-        documents = []
+Команды:
+/start - Показать это сообщение
+/help - Помощь
+"""
+    await update.message.reply_text(welcome_message)
 
-        # Handle both single file and directory
-        if isinstance(self.docx_files_path, str):
-            if os.path.isfile(self.docx_files_path):
-                files = [self.docx_files_path]
-            else:
-                files = [
-                    os.path.join(self.docx_files_path, f)
-                    for f in os.listdir(self.docx_files_path)
-                    if f.endswith('.docx')
-                ]
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /help is issued."""
+    help_text = """
+❓ Как использовать бота:
+
+1. Просто напишите свой вопрос о страховом законодательстве
+2. Бот найдет релевантную информацию в законодательных документах
+3. Вы получите ответ с указанием источников
+
+Примеры вопросов:
+• Какие виды страхования существуют?
+• Каковы права страхователя?
+• Что такое обязательное страхование?
+• Какие документы нужны для получения выплаты?
+
+Если бот не может найти ответ, попробуйте переформулировать вопрос.
+"""
+    await update.message.reply_text(help_text)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming messages with questions."""
+    global chatbot
+
+    if chatbot is None:
+        await update.message.reply_text(
+            "⚠️ Система еще загружается. Попробуйте через несколько секунд."
+        )
+        return
+
+    user_question = update.message.text
+    user_name = update.effective_user.first_name
+
+    logger.info(f"Question from {user_name}: {user_question}")
+
+    # Send typing action
+    await update.message.chat.send_action(action="typing")
+
+    try:
+        # Get answer from RAG system
+        result = chatbot.ask(user_question)
+
+        # Format response
+        answer = result['answer']
+        sources = list(set(result['sources']))
+
+        response = f"{answer}\n\n📚 Источники:\n"
+        for source in sources:
+            response += f"• {source}\n"
+
+        # Telegram message limit is 4096 characters
+        MAX_LENGTH = 4000  # Leave some margin
+
+        if len(response) <= MAX_LENGTH:
+            await update.message.reply_text(response)
         else:
-            files = self.docx_files_path
+            # Split into multiple messages
+            # First send the answer
+            if len(answer) <= MAX_LENGTH:
+                await update.message.reply_text(answer)
+                # Then send sources separately
+                sources_text = "📚 Источники:\n" + "\n".join(f"• {s}" for s in sources)
+                await update.message.reply_text(sources_text)
+            else:
+                # Answer is too long, split it
+                parts = []
+                current_part = ""
 
-        for file_path in files:
-            doc = Document(file_path)
-            full_text = []
+                # Split by sentences
+                sentences = answer.split('. ')
+                for sentence in sentences:
+                    if len(current_part) + len(sentence) + 2 < MAX_LENGTH:
+                        current_part += sentence + '. '
+                    else:
+                        if current_part:
+                            parts.append(current_part)
+                        current_part = sentence + '. '
 
-            # Extract text from paragraphs
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    full_text.append(para.text)
+                if current_part:
+                    parts.append(current_part)
 
-            # Extract text from tables
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            full_text.append(cell.text)
+                # Send all parts
+                for i, part in enumerate(parts):
+                    if i == 0:
+                        await update.message.reply_text(part)
+                    else:
+                        await update.message.reply_text(f"(продолжение)\n\n{part}")
 
-            # Create a document with metadata
-            text_content = '\n'.join(full_text)
-            documents.append(
-                LangchainDocument(
-                    page_content=text_content,
-                    metadata={"source": os.path.basename(file_path)}
-                )
-            )
+                # Send sources
+                sources_text = "📚 Источники:\n" + "\n".join(f"• {s}" for s in sources)
+                await update.message.reply_text(sources_text)
 
-        print(f"Loaded {len(documents)} documents")
-        return documents
-
-    def chunk_documents(self, documents):
-        """
-        Split documents into smaller chunks for better retrieval.
-
-        Chunk size of 1000 with 200 overlap is a good starting point.
-        Adjust based on your document structure.
-        """
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n", "\n", ". ", " ", ""]
+    except Exception as e:
+        logger.error(f"Error processing question: {e}")
+        await update.message.reply_text(
+            "❌ Извините, произошла ошибка при обработке вашего вопроса. "
+            "Попробуйте переформулировать или обратитесь позже."
         )
 
-        chunks = text_splitter.split_documents(documents)
-        print(f"Created {len(chunks)} chunks from documents")
-        return chunks
 
-    def create_vectorstore(self, chunks):
-        """Create a vector database from document chunks using Mistral embeddings."""
-        # Use Mistral embeddings
-        embeddings = MistralAIEmbeddings(
-            model="mistral-embed"  # Mistral's embedding model
-        )
-
-        # Create Chroma vector store
-        self.vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory="./insurance_law_db"
-        )
-
-        # Create retriever
-        self.retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 4}  # Retrieve top 4 most relevant chunks
-        )
-
-        print("Vector store created successfully")
-        return self.vectorstore
-
-    def setup_chain(self, model_name="mistral-large-latest"):
-        """
-        Set up the RAG chain with Mistral AI.
-
-        Available models:
-        - mistral-large-latest: Most capable, best for complex reasoning
-        - mistral-medium-latest: Balanced performance/cost
-        - mistral-small-latest: Fast and economical
-        - open-mistral-7b: Open source, cheapest
-        """
-        llm = ChatMistralAI(
-            model=model_name,
-            temperature=0  # Low temperature for factual legal responses
-        )
-
-        # Custom prompt for insurance law queries
-        template = """Вы - помощник по страховому законодательству Казахстана. 
-Используйте следующий контекст из законодательных документов для ответа на вопрос.
-Если вы не знаете ответа, скажите об этом. Не придумывайте информацию.
-Всегда ссылайтесь на конкретные статьи или разделы закона, если это возможно.
-
-Контекст: {context}
-
-Вопрос: {question}
-
-Ответ:"""
-
-        prompt = ChatPromptTemplate.from_template(template)
-
-        # Format documents function
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        # Build the chain
-        self.chain = (
-                {"context": self.retriever | format_docs, "question": RunnablePassthrough()}
-                | prompt
-                | llm
-                | StrOutputParser()
-        )
-
-        print(f"RAG chain ready with {model_name}")
-        return self.chain
-
-    def build(self, model_name="mistral-large-latest"):
-        """Build the complete RAG system."""
-        print("Building RAG system with Mistral AI...")
-
-        # Step 1: Load documents
-        documents = self.load_docx_files()
-
-        # Step 2: Chunk documents
-        chunks = self.chunk_documents(documents)
-
-        # Step 3: Create vector store
-        self.create_vectorstore(chunks)
-
-        # Step 4: Setup chain
-        self.setup_chain(model_name)
-
-        print("RAG system built successfully!")
-
-    def ask(self, question):
-        """
-        Ask a question about insurance laws.
-
-        Args:
-            question: Question in Russian or Kazakh
-
-        Returns:
-            dict with 'answer' and 'sources'
-        """
-        if not self.chain:
-            raise ValueError("Please run build() first to initialize the system")
-
-        # Get relevant documents
-        relevant_docs = self.retriever.invoke(question)
-
-        # Get answer from chain
-        answer = self.chain.invoke(question)
-
-        return {
-            "answer": answer,
-            "sources": [doc.metadata["source"] for doc in relevant_docs],
-            "source_documents": relevant_docs  # Full chunks for reference
-        }
-
-    def load_existing_vectorstore(self):
-        """Load previously created vector store without rebuilding."""
-        embeddings = MistralAIEmbeddings(model="mistral-embed")
-
-        self.vectorstore = Chroma(
-            persist_directory="./insurance_law_db",
-            embedding_function=embeddings
-        )
-
-        # Create retriever
-        self.retriever = self.vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 4}
-        )
-
-        print("Loaded existing vector store")
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors caused by updates."""
+    logger.error(f"Update {update} caused error {context.error}")
 
 
-# Example usage
-if __name__ == "__main__":
-    # Initialize the chatbot
+def initialize_chatbot(docx_path, mistral_api_key, model_name="mistral-large-latest", rebuild=False):
+    """
+    Initialize the RAG chatbot system.
+
+    Args:
+        docx_path: Path to .docx files folder
+        mistral_api_key: Mistral API key
+        model_name: Mistral model to use
+        rebuild: If True, rebuild vector store. If False, load existing.
+    """
+    global chatbot
+
+    logger.info("Initializing RAG chatbot...")
+
     chatbot = InsuranceLawChatbot(
-        docx_files_path="./insurance_laws",  # Path to your .docx files
-        api_key="your token here"  # Get from https://console.mistral.ai
+        docx_files_path=docx_path,
+        api_key=mistral_api_key
     )
 
-    # Build the RAG system (do this once)
-    # Choose your model based on needs:
-    # - "mistral-large-latest" for best quality
-    # - "mistral-small-latest" for speed/cost
-    chatbot.build(model_name="mistral-large-2512")
+    if rebuild:
+        logger.info("Building new vector store...")
+        chatbot.build(model_name=model_name)
+    else:
+        logger.info("Loading existing vector store...")
+        try:
+            chatbot.load_existing_vectorstore()
+            chatbot.setup_chain(model_name=model_name)
+        except Exception as e:
+            logger.warning(f"Could not load existing vectorstore: {e}")
+            logger.info("Building new vector store...")
+            chatbot.build(model_name=model_name)
 
-    # For subsequent runs, just load the existing vectorstore:
-    # chatbot.load_existing_vectorstore()
-    # chatbot.setup_chain("mistral-large-latest")
+    logger.info("RAG chatbot ready!")
 
-    # Ask questions in Russian or Kazakh
-    questions = [
-        "Какие виды страхования предусмотрены законом?",
-        "Каковы права страхователя?",
-        "Какие требования к страховым компаниям?",
-        "Что такое обязательное страхование?"
-    ]
 
-    for question in questions:
-        print(f"\n{'=' * 60}")
-        print(f"Вопрос: {question}")
-        print('=' * 60)
-        result = chatbot.ask(question)
-        print(f"Ответ: {result['answer']}")
-        print(f"\nИсточники: {', '.join(set(result['sources']))}")
+def main():
+    """Start the bot."""
+    # Configuration - use environment variables or config file
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your-telegram-bot-token")
+    MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "your-mistral-api-key")
+    DOCX_PATH = os.getenv("DOCX_PATH", "./insurance_laws")
+    MODEL_NAME = os.getenv("MODEL_NAME", "mistral-large-latest")
+
+    # Set to True for first run, False for subsequent runs
+    REBUILD_VECTORSTORE = os.getenv("REBUILD_VECTORSTORE", "False").lower() == "true"
+
+    # Initialize the RAG system
+    initialize_chatbot(
+        docx_path=DOCX_PATH,
+        mistral_api_key=MISTRAL_API_KEY,
+        model_name=MODEL_NAME,
+        rebuild=REBUILD_VECTORSTORE
+    )
+
+    # Create the Application
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Register error handler
+    application.add_error_handler(error_handler)
+
+    # Start the bot
+    logger.info("Starting Telegram bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    main()
