@@ -79,7 +79,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
 
     try:
-        # Get answer from RAG system
+        # Get answer from RAG system - LLM will decide if detailed or short
         result = chatbot.ask(user_question)
 
         # Format response
@@ -96,41 +96,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(response) <= MAX_LENGTH:
             await update.message.reply_text(response)
         else:
-            # Split into multiple messages
-            # First send the answer
-            if len(answer) <= MAX_LENGTH:
-                await update.message.reply_text(answer)
-                # Then send sources separately
-                sources_text = "📚 Источники:\n" + "\n".join(f"• {s}" for s in sources)
-                await update.message.reply_text(sources_text)
-            else:
-                # Answer is too long, split it
-                parts = []
-                current_part = ""
-
-                # Split by sentences
-                sentences = answer.split('. ')
-                for sentence in sentences:
-                    if len(current_part) + len(sentence) + 2 < MAX_LENGTH:
-                        current_part += sentence + '. '
-                    else:
-                        if current_part:
-                            parts.append(current_part)
-                        current_part = sentence + '. '
-
-                if current_part:
-                    parts.append(current_part)
-
-                # Send all parts
-                for i, part in enumerate(parts):
-                    if i == 0:
-                        await update.message.reply_text(part)
-                    else:
-                        await update.message.reply_text(f"(продолжение)\n\n{part}")
-
-                # Send sources
-                sources_text = "📚 Источники:\n" + "\n".join(f"• {s}" for s in sources)
-                await update.message.reply_text(sources_text)
+            # Send answer and sources separately
+            await update.message.reply_text(answer)
+            sources_text = "📚 Источники:\n" + "\n".join(f"• {s}" for s in sources)
+            await update.message.reply_text(sources_text)
 
     except Exception as e:
         logger.error(f"Error processing question: {e}")
