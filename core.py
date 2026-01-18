@@ -17,7 +17,6 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.documents import Document as LangchainDocument
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -76,7 +75,7 @@ class InsuranceLawChatbot:
         return result
 
     def load_docx_files(self):
-        """Load all .docx files from the specified path."""
+        """Load all .docx files from the specified path with enhanced metadata."""
         documents = []
 
         # Handle both single file and directory
@@ -95,30 +94,65 @@ class InsuranceLawChatbot:
         for file_path in files:
             doc = Document(file_path)
             full_text = []
+            
+            filename = os.path.basename(file_path)
 
-            # Extract text from paragraphs
-            for para in doc.paragraphs:
-                if para.text.strip():
-                    full_text.append(para.text)
+            # Extract text from paragraphs with structure preservation
+            for i, para in enumerate(doc.paragraphs):
+                text = para.text.strip()
+                if text:
+                    # Try to preserve heading/structure info
+                    if para.style and 'Heading' in para.style.name:
+                        full_text.append(f"\n{'='*50}\n{text}\n{'='*50}")
+                    else:
+                        full_text.append(text)
 
-            # Extract text from tables
-            for table in doc.tables:
-                for row in table.rows:
+            # Extract text from tables with table structure
+            for table_idx, table in enumerate(doc.tables):
+                full_text.append(f"\n[ТАБЛИЦА {table_idx + 1} из {filename}]")
+                for row_idx, row in enumerate(table.rows):
+                    row_data = []
                     for cell in row.cells:
                         if cell.text.strip():
-                            full_text.append(cell.text)
+                            row_data.append(cell.text.strip())
+                    if row_data:
+                        full_text.append(" | ".join(row_data))
 
-            # Create a document with metadata
+            # Create a document with enhanced metadata
             text_content = '\n'.join(full_text)
-            documents.append(
-                LangchainDocument(
-                    page_content=text_content,
-                    metadata={"source": os.path.basename(file_path)}
+            if text_content:  # Only add if document has content
+                documents.append(
+                    LangchainDocument(
+                        page_content=text_content,
+                        metadata={
+                            "source": filename,
+                            "type": self._get_doc_type(filename)
+                        }
+                    )
                 )
-            )
 
-        print(f"Loaded {len(documents)} documents")
+        print(f"Loaded {len(documents)} documents: {[d.metadata['source'] for d in documents]}")
         return documents
+
+    @staticmethod
+    def _get_doc_type(filename):
+        """Categorize document type for better context."""
+        if "ГКРК" in filename:
+            return "Гражданский кодекс"
+        elif "ОГПОВТС" in filename:
+            return "Обязательное страхование ТС"
+        elif "перевозчика" in filename:
+            return "Страхование перевозчика"
+        elif "туриста" in filename:
+            return "Страхование туристов"
+        elif "экологии" in filename:
+            return "Страхование окружающей среды"
+        elif "Нотариусы" in filename:
+            return "Страхование нотариусов"
+        elif "опасные" in filename:
+            return "Страхование опасных объектов"
+        else:
+            return "Прочие документы"
 
     def chunk_documents(self, documents):
         """Split documents into smaller chunks for better retrieval."""
@@ -147,10 +181,10 @@ class InsuranceLawChatbot:
             persist_directory="./insurance_law_db"
         )
 
-        # Create retriever
+        # Create retriever - set to 20 chunks for comprehensive context
         self.retriever = self.vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 4}  # Retrieve top 4 most relevant chunks
+            search_kwargs={"k": 10}  # Retrieve top 20 most relevant chunks
         )
 
         print("Vector store created successfully")
@@ -159,73 +193,78 @@ class InsuranceLawChatbot:
     def setup_chain(self, model_name="gemini-1.5-flash"):
         """
         Set up the RAG chain with Google Gemini.
-
-        Available models:
-        - gemini-2.0-flash: Latest, fastest
-        - gemini-1.5-pro: Most capable, best for complex reasoning
-        - gemini-1.5-flash: Balanced performance/cost (recommended)
         """
         from langchain_google_genai import ChatGoogleGenerativeAI
-
         self.model = ChatGoogleGenerativeAI(
             model=model_name,
-            temperature=0,  # Low temperature for factual legal responses
+            temperature=0,
             convert_system_message_to_human=True
         )
+        # Enhanced prompt to return ALL relevant information
+        template = """Вы - эксперт по казахскому страховому законодательству.
 
-        # Custom prompt for insurance law queries
-        template = """Вы - помощник по страховому законодательству Казахстана. 
-
-    ВАЖНО: 
-    - Если вопрос простой или пользователь НЕ просит подробности - давайте КРАТКИЙ ответ (2-4 предложения).
-    - Если пользователь явно просит подробный ответ (слова: "подробно", "детально", "расскажи полностью", "все детали") - давайте развернутый ответ.
-    - По умолчанию всегда отвечайте КРАТКО.
-    - Если пользователь задает уточняющий вопрос (например, "а что такое п. 2.1?", "расскажи подробнее об этом"), используйте историю разговора для понимания контекста.
+    КРИТИЧЕСКИЕ ИНСТРУКЦИИ:
+    1. ВЫДАВАЙТЕ ВСЮ РЕЛЕВАНТНУЮ ИНФОРМАЦИЮ из предоставленного контекста
+    2. Если документ содержит список (пункты, случаи, примеры) - ПЕРЕЧИСЛИТЕ ВСЕ без пропусков
+    3. Не сокращайте информацию - покажите полный список всех пунктов/случаев
+    4. Для каждого пункта/случая дайте четкое объяснение
+    5. Используйте нумерацию или маркеры для читаемости
+    6. КРИТИЧЕСКИ ВАЖНО: Если вопрос касается перечисления - выдайте ВСЕ пункты, не ограничивайте себя
 
     История разговора:
     {chat_history}
 
-    Используйте следующий контекст из законодательных документов для ответа на вопрос.
-    Если вы не знаете ответа, скажите об этом. Не придумывайте информацию.
-    Указывайте номера статей закона, если они есть в контексте.
-
-    Контекст: {context}
+    КОНТЕКСТ ИЗ ДОКУМЕНТОВ (используйте ВСЮ релевантную информацию):
+    {context}
 
     Текущий вопрос: {question}
+
+    ОТВЕТ ДОЛЖЕН:
+    - Содержать ВСЕ случаи/пункты/примеры из контекста
+    - Быть полным и развернутым при перечислении
+    - Указывать точные номера статей и пунктов
+    - Использовать нумерацию для ясности
+    - Если ответ найден в документах - добавить маркер: [ИСТОЧНИКИ_НАЙДЕНЫ]
 
     Ответ:"""
 
         prompt = ChatPromptTemplate.from_template(template)
-
         # Format documents function
         def format_docs(docs):
             if not docs:
-                return "Нет доступных документов."
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        # Format chat history function
+                return "Релевантная информация не найдена."
+            docs_by_source = {}
+            for doc in docs:
+                source = doc.metadata.get("source", "Неизвестный источник")
+                if source not in docs_by_source:
+                    docs_by_source[source] = []
+                docs_by_source[source].append(doc.page_content)
+            formatted = []
+            for source, contents in docs_by_source.items():
+                formatted.append(f"\n📄 Из '{source}':")
+                formatted.append("=" * 40)
+                for content in contents:
+                    formatted.append(content)
+                formatted.append("=" * 40)
+            return "\n".join(formatted)
+        # Format chat history
         def format_chat_history(history):
             if not history:
-                return "Нет предыдущих сообщений."
+                return "Нет истории."
             formatted = []
-            for msg in history[-6:]:  # Last 3 exchanges (6 messages)
+            for msg in history[-6:]:
                 if isinstance(msg, HumanMessage):
-                    formatted.append(f"Пользователь: {msg.content}")
+                    formatted.append(f"Вопрос: {msg.content}")
                 elif isinstance(msg, AIMessage):
-                    formatted.append(f"Ассистент: {msg.content}")
+                    formatted.append(f"Ответ: {msg.content}")
             return "\n".join(formatted)
-
-        # Store format functions for later use
         self.format_docs = format_docs
         self.format_chat_history = format_chat_history
-
-        # Build the chain with passthrough
         self.chain = (
-            prompt
-            | self.model
-            | StrOutputParser()
+                prompt
+                | self.model
+                | StrOutputParser()
         )
-
         print(f"RAG chain ready with {model_name}")
         return self.chain
 
@@ -302,10 +341,8 @@ class InsuranceLawChatbot:
             # Prepare context
             if relevant_docs:
                 formatted_context = self.format_docs(relevant_docs)
-                has_relevant_docs = True
             else:
                 formatted_context = "Релевантные документы не найдены."
-                has_relevant_docs = False
 
             # Build the input for the chain
             chain_input = {
@@ -315,7 +352,13 @@ class InsuranceLawChatbot:
             }
 
             # Get answer from chain
-            answer = self.chain.invoke(chain_input)
+            full_answer = self.chain.invoke(chain_input)
+
+            # Check if LLM decided to include sources marker
+            has_sources_marker = "[ИСТОЧНИКИ_НАЙДЕНЫ]" in full_answer
+            
+            # Remove the marker from the answer for display
+            answer = full_answer.replace("[ИСТОЧНИКИ_НАЙДЕНЫ]", "").strip()
 
             # Add to chat history
             chat_history.add_user_message(question)
@@ -325,7 +368,7 @@ class InsuranceLawChatbot:
                 "answer": answer,
                 "sources": [doc.metadata["source"] for doc in relevant_docs] if relevant_docs else [],
                 "source_documents": relevant_docs,
-                "has_sources": has_relevant_docs and len(relevant_docs) > 0
+                "has_sources": has_sources_marker and len(relevant_docs) > 0
             }
 
         except Exception as e:
@@ -364,13 +407,19 @@ class InsuranceLawChatbot:
             embedding_function=embeddings
         )
 
-        # Create retriever
+        # Create retriever - set to 20 chunks for comprehensive context
         self.retriever = self.vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 4}
+            search_kwargs={"k": 10}  # Retrieve top 20 most relevant chunks
         )
 
         print("Loaded existing vector store")
+
+    def get_knowledge_base_status(self) -> dict:
+        """Get information about loaded knowledge base."""
+        from manager import KnowledgeManager
+        km = KnowledgeManager()
+        return km.get_knowledge_base_info()
 
 
 # Example usage
