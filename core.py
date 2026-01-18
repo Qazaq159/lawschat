@@ -1,9 +1,19 @@
 import os
 import unicodedata
+import warnings
+
+# Suppress warnings
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+import google.generativeai as genai
 from docx import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain_mistralai import ChatMistralAI, MistralAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.documents import Document as LangchainDocument
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -15,48 +25,55 @@ from langchain_core.messages import HumanMessage, AIMessage
 class InsuranceLawChatbot:
     def __init__(self, docx_files_path, api_key=None, redis_url="redis://localhost:6379"):
         """
-        Initialize the RAG chatbot for Kazakhstani insurance laws using Mistral AI.
+        Initialize the RAG chatbot for Kazakhstani insurance laws using Google Gemini.
 
         Args:
             docx_files_path: Path to folder containing .docx files or list of file paths
-            api_key: Mistral API key (or set MISTRAL_API_KEY env variable)
+            api_key: Google API key (or set GOOGLE_API_KEY env variable)
             redis_url: Redis connection URL (default: redis://localhost:6379)
         """
         if api_key:
-            os.environ["MISTRAL_API_KEY"] = api_key
+            os.environ["GOOGLE_API_KEY"] = api_key
+
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
         self.docx_files_path = docx_files_path
         self.redis_url = redis_url
         self.vectorstore = None
         self.retriever = None
         self.chain = None
+        self.model = None
 
     @staticmethod
     def normalize_text(text):
         """
         Normalize text to avoid tokenizer issues with special characters.
-        Converts special Cyrillic/Latin lookalikes to standard characters.
+        Removes or replaces problematic characters.
         """
+        if not text or not isinstance(text, str):
+            return ""
+
         # Normalize unicode (NFC normalization)
-        text = unicodedata.normalize('NFC', text)
+        text = unicodedata.normalize('NFKC', text)
 
-        # Replace common problematic characters
-        replacements = {
-            'һ': 'h',  # Cyrillic 'һ' to Latin 'h'
-            'ә': 'ə',  # Kazakh 'ә'
-            'ғ': 'ғ',  # Kazakh 'ғ'
-            'қ': 'қ',  # Kazakh 'қ'
-            'ң': 'ң',  # Kazakh 'ң'
-            'ө': 'ө',  # Kazakh 'ө'
-            'ұ': 'ұ',  # Kazakh 'ұ'
-            'ү': 'ү',  # Kazakh 'ү'
-            'і': 'і',  # Kazakh 'і'
-        }
+        # Remove or replace characters that cause tokenizer issues
+        safe_chars = []
+        for char in text:
+            code = ord(char)
+            # Basic Latin, Cyrillic, common punctuation, spaces
+            if (32 <= code <= 126 or  # Basic Latin
+                    1024 <= code <= 1279 or  # Cyrillic
+                    char in ' .,;:!?-—–()[]{}\"\'`' or  # Punctuation
+                    char.isspace()):
+                safe_chars.append(char)
+            else:
+                safe_chars.append(' ')
 
-        for old, new in replacements.items():
-            text = text.replace(old, new)
+        result = ''.join(safe_chars)
+        # Remove multiple spaces
+        result = ' '.join(result.split())
 
-        return text
+        return result
 
     def load_docx_files(self):
         """Load all .docx files from the specified path."""
@@ -104,12 +121,7 @@ class InsuranceLawChatbot:
         return documents
 
     def chunk_documents(self, documents):
-        """
-        Split documents into smaller chunks for better retrieval.
-
-        Chunk size of 1000 with 200 overlap is a good starting point.
-        Adjust based on your document structure.
-        """
+        """Split documents into smaller chunks for better retrieval."""
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -122,10 +134,10 @@ class InsuranceLawChatbot:
         return chunks
 
     def create_vectorstore(self, chunks):
-        """Create a vector database from document chunks using Mistral embeddings."""
-        # Use Mistral embeddings (fast API-based)
-        embeddings = MistralAIEmbeddings(
-            model="mistral-embed"  # Mistral's embedding model
+        """Create a vector database from document chunks using Google embeddings."""
+        # Use Google embeddings
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001"
         )
 
         # Create Chroma vector store
@@ -144,47 +156,51 @@ class InsuranceLawChatbot:
         print("Vector store created successfully")
         return self.vectorstore
 
-    def setup_chain(self, model_name="mistral-large-2512"):
+    def setup_chain(self, model_name="gemini-1.5-flash"):
         """
-        Set up the RAG chain with Mistral AI.
+        Set up the RAG chain with Google Gemini.
 
         Available models:
-        - mistral-large-2512: Most capable, best for complex reasoning
-        - mistral-medium-latest: Balanced performance/cost
-        - mistral-small-latest: Fast and economical
-        - open-mistral-7b: Open source, cheapest
+        - gemini-2.0-flash: Latest, fastest
+        - gemini-1.5-pro: Most capable, best for complex reasoning
+        - gemini-1.5-flash: Balanced performance/cost (recommended)
         """
-        llm = ChatMistralAI(
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        self.model = ChatGoogleGenerativeAI(
             model=model_name,
-            temperature=0  # Low temperature for factual legal responses
+            temperature=0,  # Low temperature for factual legal responses
+            convert_system_message_to_human=True
         )
 
-        # Custom prompt for insurance law queries - WITH CONVERSATION HISTORY
+        # Custom prompt for insurance law queries
         template = """Вы - помощник по страховому законодательству Казахстана. 
 
-ВАЖНО: 
-- Если вопрос простой или пользователь НЕ просит подробности - давайте КРАТКИЙ ответ (2-4 предложения).
-- Если пользователь явно просит подробный ответ (слова: "подробно", "детально", "расскажи полностью", "все детали") - давайте развернутый ответ.
-- По умолчанию всегда отвечайте КРАТКО.
-- Если пользователь задает уточняющий вопрос (например, "а что такое п. 2.1?", "расскажи подробнее об этом"), используйте историю разговора для понимания контекста.
+    ВАЖНО: 
+    - Если вопрос простой или пользователь НЕ просит подробности - давайте КРАТКИЙ ответ (2-4 предложения).
+    - Если пользователь явно просит подробный ответ (слова: "подробно", "детально", "расскажи полностью", "все детали") - давайте развернутый ответ.
+    - По умолчанию всегда отвечайте КРАТКО.
+    - Если пользователь задает уточняющий вопрос (например, "а что такое п. 2.1?", "расскажи подробнее об этом"), используйте историю разговора для понимания контекста.
 
-История разговора:
-{chat_history}
+    История разговора:
+    {chat_history}
 
-Используйте следующий контекст из законодательных документов для ответа на вопрос.
-Если вы не знаете ответа, скажите об этом. Не придумывайте информацию.
-Указывайте номера статей закона, если они есть в контексте.
+    Используйте следующий контекст из законодательных документов для ответа на вопрос.
+    Если вы не знаете ответа, скажите об этом. Не придумывайте информацию.
+    Указывайте номера статей закона, если они есть в контексте.
 
-Контекст: {context}
+    Контекст: {context}
 
-Текущий вопрос: {question}
+    Текущий вопрос: {question}
 
-Ответ:"""
+    Ответ:"""
 
         prompt = ChatPromptTemplate.from_template(template)
 
         # Format documents function
         def format_docs(docs):
+            if not docs:
+                return "Нет доступных документов."
             return "\n\n".join(doc.page_content for doc in docs)
 
         # Format chat history function
@@ -203,22 +219,19 @@ class InsuranceLawChatbot:
         self.format_docs = format_docs
         self.format_chat_history = format_chat_history
 
-        # Build the chain
+        # Build the chain with passthrough
         self.chain = (
-                {"context": self.retriever | format_docs,
-                 "question": RunnablePassthrough(),
-                 "chat_history": lambda x: ""}  # Will be filled in ask() method
-                | prompt
-                | llm
-                | StrOutputParser()
+            prompt
+            | self.model
+            | StrOutputParser()
         )
 
         print(f"RAG chain ready with {model_name}")
         return self.chain
 
-    def build(self, model_name="mistral-large-2512"):
+    def build(self, model_name="gemini-1.5-flash"):
         """Build the complete RAG system."""
-        print("Building RAG system with Mistral AI...")
+        print("Building RAG system with Google Gemini...")
 
         # Step 1: Load documents
         documents = self.load_docx_files()
@@ -240,49 +253,91 @@ class InsuranceLawChatbot:
 
         Args:
             question: Question in Russian or Kazakh
-            user_id: Unique identifier for the user (to maintain separate chat histories)
+            user_id: Unique identifier for the user
 
         Returns:
-            dict with 'answer' and 'sources'
+            dict with 'answer', 'sources', and 'has_sources' flag
         """
         if not self.chain:
             raise ValueError("Please run build() first to initialize the system")
 
-        # Normalize text to avoid tokenizer issues
+        # Normalize text
         normalized_question = self.normalize_text(question)
 
-        # Get or create Redis chat history for this user
-        chat_history = RedisChatMessageHistory(
-            session_id=f"user:{user_id}",
-            url=self.redis_url,
-            ttl=86400  # Keep history for 24 hours (optional)
-        )
+        # Safety check
+        if not normalized_question or len(normalized_question.strip()) < 2:
+            return {
+                "answer": "Извините, я не смог обработать ваш вопрос. Попробуйте переформулировать.",
+                "sources": [],
+                "source_documents": [],
+                "has_sources": False
+            }
 
-        # Get relevant documents
-        relevant_docs = self.retriever.invoke(normalized_question)
+        try:
+            # Get or create Redis chat history for this user
+            chat_history = RedisChatMessageHistory(
+                session_id=f"user:{user_id}",
+                url=self.redis_url,
+                ttl=86400
+            )
 
-        # Format chat history
-        formatted_history = self.format_chat_history(chat_history.messages)
+            # Get relevant documents with error handling
+            try:
+                relevant_docs = self.retriever.invoke(normalized_question)
+            except Exception as e:
+                print(f"Retriever error: {e}")
+                simple_question = ''.join(c for c in normalized_question if c.isalnum() or c.isspace())
+                if simple_question:
+                    try:
+                        relevant_docs = self.retriever.invoke(simple_question)
+                    except Exception as e2:
+                        print(f"Simple question retrieval also failed: {e2}")
+                        relevant_docs = []
+                else:
+                    relevant_docs = []
 
-        # Prepare context with history
-        context_with_history = {
-            "context": self.format_docs(relevant_docs),
-            "question": normalized_question,
-            "chat_history": formatted_history
-        }
+            # Format chat history
+            formatted_history = self.format_chat_history(chat_history.messages)
 
-        # Get answer from chain
-        answer = self.chain.invoke(context_with_history)
+            # Prepare context
+            if relevant_docs:
+                formatted_context = self.format_docs(relevant_docs)
+                has_relevant_docs = True
+            else:
+                formatted_context = "Релевантные документы не найдены."
+                has_relevant_docs = False
 
-        # Add ORIGINAL question to chat history (not normalized)
-        chat_history.add_user_message(question)
-        chat_history.add_ai_message(answer)
+            # Build the input for the chain
+            chain_input = {
+                "context": formatted_context,
+                "question": normalized_question,
+                "chat_history": formatted_history
+            }
 
-        return {
-            "answer": answer,
-            "sources": [doc.metadata["source"] for doc in relevant_docs],
-            "source_documents": relevant_docs  # Full chunks for reference
-        }
+            # Get answer from chain
+            answer = self.chain.invoke(chain_input)
+
+            # Add to chat history
+            chat_history.add_user_message(question)
+            chat_history.add_ai_message(answer)
+
+            return {
+                "answer": answer,
+                "sources": [doc.metadata["source"] for doc in relevant_docs] if relevant_docs else [],
+                "source_documents": relevant_docs,
+                "has_sources": has_relevant_docs and len(relevant_docs) > 0
+            }
+
+        except Exception as e:
+            print(f"Error in ask(): {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "answer": "Извините, произошла ошибка при обработке вашего вопроса. Попробуйте задать вопрос по-другому или используйте команду /clear для начала нового разговора.",
+                "sources": [],
+                "source_documents": [],
+                "has_sources": False
+            }
 
     def clear_history(self, user_id="default"):
         """Clear chat history for a specific user."""
@@ -302,7 +357,7 @@ class InsuranceLawChatbot:
 
     def load_existing_vectorstore(self):
         """Load previously created vector store without rebuilding."""
-        embeddings = MistralAIEmbeddings(model="mistral-embed")
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
         self.vectorstore = Chroma(
             persist_directory="./insurance_law_db",
@@ -320,23 +375,19 @@ class InsuranceLawChatbot:
 
 # Example usage
 if __name__ == "__main__":
-    # Initialize the chatbot
     chatbot = InsuranceLawChatbot(
-        docx_files_path="./insurance_laws",  # Path to your .docx files
-        api_key="your mistral token"  # Get from https://console.mistral.ai
+        docx_files_path="./insurance_laws",
+        api_key="your-google-api-key"  # Get from https://ai.google.dev
     )
 
     # Build the RAG system (do this once)
-    # Choose your model based on needs:
-    # - "mistral-large-2512" for best quality
-    # - "mistral-small-latest" for speed/cost
-    chatbot.build(model_name="mistral-large-2512")
+    chatbot.build(model_name="gemini-1.5-flash")
 
-    # For subsequent runs, just load the existing vectorstore:
+    # For subsequent runs:
     # chatbot.load_existing_vectorstore()
-    # chatbot.setup_chain("mistral-large-2512")
+    # chatbot.setup_chain("gemini-1.5-flash")
 
-    # Ask questions in Russian or Kazakh
+    # Ask questions
     questions = [
         "Какие виды страхования предусмотрены законом?",
         "Каковы права страхователя?",
@@ -348,6 +399,6 @@ if __name__ == "__main__":
         print(f"\n{'=' * 60}")
         print(f"Вопрос: {question}")
         print('=' * 60)
-        result = chatbot.ask(question)  # LLM decides short or detailed automatically
+        result = chatbot.ask(question)
         print(f"Ответ: {result['answer']}")
         print(f"\nИсточники: {', '.join(set(result['sources']))}")
