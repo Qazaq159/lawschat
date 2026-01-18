@@ -1,0 +1,27 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Install system dependencies only once
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only requirements first (better layer caching)
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    --disable-pip-version-check \
+    -r requirements.txt
+
+# Copy app code last (changes frequently)
+COPY api.py core.py manager.py ./
+
+# Create necessary directories
+RUN mkdir -p insurance_laws knowledge_base insurance_law_db
+
+EXPOSE 8000
+
+# Run web app
+CMD ["python", "-u", "api.py"]
